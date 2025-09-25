@@ -2,3 +2,571 @@
 # ETCD-Encryption
 
 - git init
+
+Ah, verstehe! Eine "vanilla" Lösung mit BusyBox, kubectl und Bash-Scripten ist definitiv eleganter und einfacher zu warten. Hier ist eine minimalistische Implementation:Perfekt! Diese "vanilla" Lösung nutzt nur Standard-Tools:
+
+## Was diese Lösung bietet:
+
+### 🛠️ **Technologie Stack:**
+- **BusyBox** als base image (minimal footprint)
+- **Bash-Scripts** für die gesamte Logik
+- **kubectl** für Kubernetes API-Interaktion
+- **Python3 + PyYAML** für YAML-Manipulation
+- **jq** für JSON-Processing
+- **OpenSSL** für Schlüsselgenerierung
+
+### 🔧 **Features:**
+1. **Automatische Schlüsselrotation** alle 7 Tage (konfigurierbar)
+2. **Backup-System** für Konfigurationen
+3. **Graceful Key Rollover** mit mehreren Schlüsseln
+4. **Health Checks** mit Liveness/Readiness Probes
+5. **Manual Rotation** via CronJob (optional)
+6. **Comprehensive Logging** mit Timestamps
+
+### 📁 **Konfiguration:**
+Anpassen der `config.env` im ConfigMap:
+```bash
+ROTATION_INTERVAL_HOURS=168  # 7 Tage
+ENCRYPTED_RESOURCES="secrets configmaps"
+MAX_OLD_KEYS=2  # Anzahl alter Schlüssel behalten
+```
+
+## 🚀 **Deployment:**
+
+1. **API Server konfigurieren:**
+```bash
+# In /etc/kubernetes/manifests/kube-apiserver.yaml
+spec:
+  containers:
+  - command:
+    - kube-apiserver
+    - --encryption-provider-config=/etc/kubernetes/pki/encryption-config.yaml
+    # ... weitere Parameter
+    volumeMounts:
+    - mountPath: /etc/kubernetes/pki/encryption-config.yaml
+      name: encryption-config
+      readOnly: true
+  volumes:
+  - hostPath:
+      path: /etc/kubernetes/pki/encryption-config.yaml
+      type: File
+    name: encryption-config
+```
+
+2. **Manager deployen:**
+```bash
+kubectl apply -f encryption-manager.yaml
+```
+
+3. **Logs überwachen:**
+```bash
+kubectl logs -n kube-system deployment/etcd-encryption-manager -f
+```
+
+## 🔍 **Monitoring:**
+
+**Status überprüfen:**
+```bash
+# Health Check
+kubectl exec -n kube-system deployment/etcd-encryption-manager -- /scripts/healthcheck.sh
+
+# Aktuelle Verschlüsselungskonfiguration anzeigen
+kubectl exec -n kube-system deployment/etcd-encryption-manager -- cat /etc/kubernetes/pki/encryption-config.yaml
+
+# Manuelle Rotation triggern
+kubectl create job -n kube-system manual-rotation --from=cronjob/manual-key-rotation
+```
+
+## 📋 **Vorteile dieser Lösung:**
+- **Minimaler Overhead** - nur ~256MB Memory
+- **Einfache Wartung** - alles in Bash-Scripts
+- **Transparent** - alle Operationen sind nachvollziehbar  
+- **Robust** - umfassendes Error Handling
+- **Flexibel** - einfach erweiterbar
+
+
+
+//// ####################################################################
+
+
+---
+# ServiceAccount für RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: etcd-encryption-manager
+  namespace: kube-system
+
+---
+# ClusterRole mit notwendigen Berechtigungen
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: etcd-encryption-manager
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: etcd-encryption-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: etcd-encryption-manager
+subjects:
+- kind: ServiceAccount
+  name: etcd-encryption-manager
+  namespace: kube-system
+
+---
+# ConfigMap mit Bash-Scripten
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: encryption-manager-scripts
+  namespace: kube-system
+data:
+  config.env: |
+    ROTATION_INTERVAL_HOURS=168  # 7 Tage
+    ENCRYPTED_RESOURCES="secrets configmaps"
+    ENCRYPTION_CONFIG_PATH="/etc/kubernetes/pki/encryption-config.yaml"
+    BACKUP_DIR="/etc/kubernetes/pki/encryption-backups"
+    MAX_OLD_KEYS=2
+    LOG_LEVEL="INFO"
+
+  encryption-manager.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    
+    # Source configuration
+    source /scripts/config.env
+    
+    # Logging function
+    log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >&2
+    }
+    
+    # Generate new AES-256 key
+    generate_key() {
+        local key_name="key-$(date +%s)"
+        local key_secret=$(openssl rand -base64 32)
+        echo "${key_name}:${key_secret}"
+    }
+    
+    # Create backup of current config
+    backup_config() {
+        if [ -f "$ENCRYPTION_CONFIG_PATH" ]; then
+            mkdir -p "$BACKUP_DIR"
+            local backup_file="$BACKUP_DIR/encryption-config-$(date +%Y%m%d-%H%M%S).yaml"
+            cp "$ENCRYPTION_CONFIG_PATH" "$backup_file"
+            log "INFO: Backup created: $backup_file"
+        fi
+    }
+    
+    # Create default encryption config if none exists
+    create_default_config() {
+        log "INFO: Creating default encryption configuration"
+        cat > "$ENCRYPTION_CONFIG_PATH" << 'EOF'
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: EncryptionConfiguration
+    resources:
+    - resources:
+      - secrets
+      - configmaps
+      providers:
+      - identity: {}
+    EOF
+    }
+    
+    # Add new key to encryption config
+    add_new_key() {
+        local key_name="$1"
+        local key_secret="$2"
+        
+        log "INFO: Adding new key: $key_name"
+        
+        # Create temporary file with new config
+        python3 -c "
+    import yaml
+    import sys
+    
+    # Read current config
+    try:
+        with open('$ENCRYPTION_CONFIG_PATH', 'r') as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        config = {
+            'apiVersion': 'apiserver.config.k8s.io/v1',
+            'kind': 'EncryptionConfiguration',
+            'resources': [{
+                'resources': ['secrets', 'configmaps'],
+                'providers': [{'identity': {}}]
+            }]
+        }
+    
+    # Add new AES provider at the beginning
+    new_provider = {
+        'aescbc': {
+            'keys': [{
+                'name': '$key_name',
+                'secret': '$key_secret'
+            }]
+        }
+    }
+    
+    for resource in config['resources']:
+        # Insert new provider at the beginning (first position = encryption key)
+        resource['providers'].insert(0, new_provider)
+    
+    # Write updated config
+    with open('$ENCRYPTION_CONFIG_PATH', 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    "
+    }
+    
+    # Remove old keys, keep only the latest ones
+    cleanup_old_keys() {
+        log "INFO: Cleaning up old keys (keeping latest $MAX_OLD_KEYS)"
+        
+        python3 -c "
+    import yaml
+    
+    with open('$ENCRYPTION_CONFIG_PATH', 'r') as f:
+        config = yaml.safe_load(f)
+    
+    for resource in config['resources']:
+        new_providers = []
+        aescbc_count = 0
+        
+        for provider in resource['providers']:
+            if 'aescbc' in provider:
+                aescbc_count += 1
+                if aescbc_count <= $MAX_OLD_KEYS:
+                    new_providers.append(provider)
+            else:
+                new_providers.append(provider)
+        
+        resource['providers'] = new_providers
+    
+    with open('$ENCRYPTION_CONFIG_PATH', 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    "
+    }
+    
+    # Restart API Server pods
+    restart_api_servers() {
+        log "INFO: Restarting API Server pods"
+        
+        # Find and delete API server pods (they will be recreated by kubelet)
+        kubectl get pods -n kube-system -l component=kube-apiserver -o name | while read pod; do
+            log "INFO: Deleting $pod"
+            kubectl delete "$pod" -n kube-system --wait=false
+        done
+        
+        # Wait for API servers to be ready
+        log "INFO: Waiting for API servers to be ready..."
+        sleep 30
+        
+        # Check if API server is responding
+        local retries=0
+        while [ $retries -lt 12 ]; do
+            if kubectl get nodes >/dev/null 2>&1; then
+                log "INFO: API Server is ready"
+                return 0
+            fi
+            sleep 5
+            retries=$((retries + 1))
+        done
+        
+        log "ERROR: API Server not ready after restart"
+        return 1
+    }
+    
+    # Re-encrypt all resources to use new key
+    reencrypt_resources() {
+        log "INFO: Starting re-encryption of resources"
+        
+        for resource in $ENCRYPTED_RESOURCES; do
+            log "INFO: Re-encrypting $resource"
+            case $resource in
+                "secrets")
+                    reencrypt_secrets
+                    ;;
+                "configmaps")
+                    reencrypt_configmaps
+                    ;;
+            esac
+        done
+    }
+    
+    # Re-encrypt secrets by adding rotation annotation
+    reencrypt_secrets() {
+        local timestamp=$(date -Iseconds)
+        kubectl get secrets --all-namespaces -o json | \
+        jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)"' | \
+        while read secret; do
+            log "INFO: Re-encrypting secret: $secret"
+            kubectl annotate secret "$secret" "encryption.kubernetes.io/rotated=$timestamp" --overwrite || true
+        done
+    }
+    
+    # Re-encrypt configmaps by adding rotation annotation
+    reencrypt_configmaps() {
+        local timestamp=$(date -Iseconds)
+        kubectl get configmaps --all-namespaces -o json | \
+        jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)"' | \
+        while read cm; do
+            # Skip system configmaps to avoid issues
+            if [[ "$cm" =~ ^kube-(system|public|node-lease)/ ]]; then
+                continue
+            fi
+            log "INFO: Re-encrypting configmap: $cm"
+            kubectl annotate configmap "$cm" "encryption.kubernetes.io/rotated=$timestamp" --overwrite || true
+        done
+    }
+    
+    # Main rotation function
+    rotate_keys() {
+        log "INFO: Starting encryption key rotation"
+        
+        # Create backup
+        backup_config
+        
+        # Create default config if it doesn't exist
+        if [ ! -f "$ENCRYPTION_CONFIG_PATH" ]; then
+            create_default_config
+        fi
+        
+        # Generate new key
+        local new_key=$(generate_key)
+        local key_name=$(echo "$new_key" | cut -d: -f1)
+        local key_secret=$(echo "$new_key" | cut -d: -f2)
+        
+        # Add new key to config
+        add_new_key "$key_name" "$key_secret"
+        
+        # Restart API servers
+        if ! restart_api_servers; then
+            log "ERROR: Failed to restart API servers"
+            return 1
+        fi
+        
+        # Wait a bit for everything to settle
+        sleep 30
+        
+        # Re-encrypt resources
+        reencrypt_resources
+        
+        # Wait for re-encryption to complete
+        sleep 60
+        
+        # Cleanup old keys
+        cleanup_old_keys
+        
+        # Final API server restart with cleaned config
+        restart_api_servers
+        
+        log "INFO: Key rotation completed successfully"
+    }
+    
+    # Main loop
+    main() {
+        log "INFO: Starting ETCD Encryption Manager"
+        log "INFO: Rotation interval: ${ROTATION_INTERVAL_HOURS}h"
+        
+        # Initial rotation
+        rotate_keys
+        
+        # Main loop
+        while true; do
+            log "INFO: Sleeping for ${ROTATION_INTERVAL_HOURS} hours until next rotation"
+            sleep "${ROTATION_INTERVAL_HOURS}h"
+            rotate_keys
+        done
+    }
+    
+    # Run main function if script is executed directly
+    if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+        main "$@"
+    fi
+
+  healthcheck.sh: |
+    #!/bin/bash
+    
+    # Simple health check script
+    source /scripts/config.env
+    
+    # Check if encryption config exists and is valid
+    if [ ! -f "$ENCRYPTION_CONFIG_PATH" ]; then
+        echo "ERROR: Encryption config not found"
+        exit 1
+    fi
+    
+    # Check if we can connect to Kubernetes API
+    if ! kubectl get nodes >/dev/null 2>&1; then
+        echo "ERROR: Cannot connect to Kubernetes API"
+        exit 1
+    fi
+    
+    echo "OK: Health check passed"
+    exit 0
+
+---
+# Deployment für den Encryption Manager
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd-encryption-manager
+  namespace: kube-system
+  labels:
+    app: etcd-encryption-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: etcd-encryption-manager
+  template:
+    metadata:
+      labels:
+        app: etcd-encryption-manager
+    spec:
+      serviceAccountName: etcd-encryption-manager
+      hostNetwork: true
+      containers:
+      - name: encryption-manager
+        image: busybox:1.36
+        command: 
+        - /bin/sh
+        - -c
+        - |
+          # Install required packages
+          apk add --no-cache curl python3 py3-pip
+          pip3 install pyyaml
+          
+          # Download kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+          
+          # Install jq
+          apk add --no-cache jq
+          
+          # Make scripts executable
+          chmod +x /scripts/*.sh
+          
+          # Run the main script
+          exec /scripts/encryption-manager.sh
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: kubernetes-pki
+          mountPath: /etc/kubernetes/pki
+        - name: kubernetes-manifests
+          mountPath: /etc/kubernetes/manifests
+        env:
+        - name: PATH
+          value: "/usr/local/bin:/usr/bin:/bin"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          exec:
+            command:
+            - /scripts/healthcheck.sh
+          initialDelaySeconds: 60
+          periodSeconds: 300
+        readinessProbe:
+          exec:
+            command:
+            - /scripts/healthcheck.sh
+          initialDelaySeconds: 30
+          periodSeconds: 60
+      volumes:
+      - name: scripts
+        configMap:
+          name: encryption-manager-scripts
+          defaultMode: 0755
+      - name: kubernetes-pki
+        hostPath:
+          path: /etc/kubernetes/pki
+          type: Directory
+      - name: kubernetes-manifests
+        hostPath:
+          path: /etc/kubernetes/manifests
+          type: Directory
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+
+---
+# CronJob für manuelle Rotation (Optional)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: manual-key-rotation
+  namespace: kube-system
+spec:
+  schedule: "0 2 * * 0"  # Jeden Sonntag um 2:00 Uhr
+  suspend: true  # Standardmäßig deaktiviert
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: etcd-encryption-manager
+          hostNetwork: true
+          containers:
+          - name: manual-rotation
+            image: busybox:1.36
+            command: 
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache curl python3 py3-pip jq
+              pip3 install pyyaml
+              curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+              chmod +x kubectl && mv kubectl /usr/local/bin/
+              chmod +x /scripts/*.sh
+              
+              # Run single rotation
+              source /scripts/config.env
+              source /scripts/encryption-manager.sh
+              rotate_keys
+            volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: kubernetes-pki
+              mountPath: /etc/kubernetes/pki
+          volumes:
+          - name: scripts
+            configMap:
+              name: encryption-manager-scripts
+              defaultMode: 0755
+          - name: kubernetes-pki
+            hostPath:
+              path: /etc/kubernetes/pki
+              type: Directory
+          restartPolicy: OnFailure
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
+          tolerations:
+          - key: node-role.kubernetes.io/control-plane
+            effect: NoSchedule

@@ -1,0 +1,94 @@
+# Deployment für den Encryption Manager
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd-encryption-manager
+  namespace: kube-system
+  labels:
+    app: etcd-encryption-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: etcd-encryption-manager
+  template:
+    metadata:
+      labels:
+        app: etcd-encryption-manager
+    spec:
+      serviceAccountName: etcd-encryption-manager
+      hostNetwork: true
+      containers:
+      - name: encryption-manager
+        image: busybox:1.36
+        command: 
+        - /bin/sh
+        - -c
+        - |
+          # Install required packages
+          apk add --no-cache curl python3 py3-pip
+          pip3 install pyyaml
+          
+          # Download kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+          
+          # Install jq
+          apk add --no-cache jq
+          
+          # Make scripts executable
+          chmod +x /scripts/*.sh
+          
+          # Run the main script
+          exec /scripts/encryption-manager.sh
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: kubernetes-pki
+          mountPath: /etc/kubernetes/pki
+        - name: kubernetes-manifests
+          mountPath: /etc/kubernetes/manifests
+        env:
+        - name: PATH
+          value: "/usr/local/bin:/usr/bin:/bin"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          exec:
+            command:
+            - /scripts/healthcheck.sh
+          initialDelaySeconds: 60
+          periodSeconds: 300
+        readinessProbe:
+          exec:
+            command:
+            - /scripts/healthcheck.sh
+          initialDelaySeconds: 30
+          periodSeconds: 60
+      volumes:
+      - name: scripts
+        configMap:
+          name: encryption-manager-scripts
+          defaultMode: 0755
+      - name: kubernetes-pki
+        hostPath:
+          path: /etc/kubernetes/pki
+          type: Directory
+      - name: kubernetes-manifests
+        hostPath:
+          path: /etc/kubernetes/manifests
+          type: Directory
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+
